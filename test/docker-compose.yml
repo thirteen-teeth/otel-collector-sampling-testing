@@ -1,0 +1,178 @@
+version: "3.8"
+
+# ─── Network ────────────────────────────────────────────────────────────────
+networks:
+  otel-test:
+    driver: bridge
+
+# ─── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  kafka-data:
+
+# ─── Services ───────────────────────────────────────────────────────────────
+services:
+
+  # ---------------------------------------------------------------------------
+  # Single-node Kafka in KRaft mode (no ZooKeeper).
+  # Pinned to a specific patch version for reproducibility.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    hostname: kafka
+    container_name: otel-test-kafka
+    networks:
+      - otel-test
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    environment:
+      # KRaft mode: combined broker + controller in one process.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"        # fixed 22-char base64 UUID
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Replication factor 1 is correct for a single-node test cluster.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      # Tune for throughput over durability in tests.
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 10000
+      KAFKA_LOG_FLUSH_INTERVAL_MS: 1000
+      KAFKA_LOG_RETENTION_HOURS: 2
+      KAFKA_LOG_SEGMENT_BYTES: 104857600
+      # Allow the validator's unique consumer groups to read from the beginning.
+      KAFKA_AUTO_OFFSET_RESET: earliest
+    healthcheck:
+      test:
+        - CMD
+        - kafka-broker-api-versions
+        - --bootstrap-server
+        - localhost:9092
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: "${KAFKA_MEMORY:-768m}"
+
+  # ---------------------------------------------------------------------------
+  # Topic initialiser: creates raw and sampled topics then exits.
+  # Waits for Kafka to be ready before running.
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: otel-test-kafka-init
+    networks:
+      - otel-test
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating topics..."
+        kafka-topics --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic otel-traces-raw \
+          --partitions ${KAFKA_PARTITIONS:-6} \
+          --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic otel-traces-sampled \
+          --partitions ${KAFKA_PARTITIONS:-6} \
+          --replication-factor 1
+        echo "Topics created:"
+        kafka-topics --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Raw-ingest Collector: receives OTLP and writes 100% to otel-traces-raw.
+  # ---------------------------------------------------------------------------
+  ingest-collector:
+    image: otel/opentelemetry-collector-contrib:${OTELCOL_VERSION:-0.108.0}
+    container_name: otel-test-ingest
+    hostname: ingest-collector
+    networks:
+      - otel-test
+    ports:
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+      - "13133:13133"   # health_check
+      - "8888:8888"     # Prometheus metrics
+    volumes:
+      - ./config/ingest-collector.yaml:/config/config.yaml:ro
+    command: ["--config=/config/config.yaml"]
+    environment:
+      KAFKA_BROKER: kafka:9092
+      INGEST_MEMORY_LIMIT_MIB: "${INGEST_MEMORY_LIMIT_MIB:-512}"
+      INGEST_SPIKE_LIMIT_MIB: "${INGEST_SPIKE_LIMIT_MIB:-128}"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:13133"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: "${INGEST_MEMORY:-640m}"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Tail-sampling Collector: consumes otel-traces-raw, applies 10% probabilistic
+  # tail sampling, and writes retained traces to otel-traces-sampled.
+  # Run exactly ONE replica so all spans for a trace reach the same sampler.
+  # ---------------------------------------------------------------------------
+  tail-sampler:
+    image: otel/opentelemetry-collector-contrib:${OTELCOL_VERSION:-0.108.0}
+    container_name: otel-test-tail-sampler
+    hostname: tail-sampler
+    networks:
+      - otel-test
+    ports:
+      - "13134:13133"   # health_check (mapped to different host port)
+      - "8889:8888"     # Prometheus metrics
+    volumes:
+      - ./config/tail-sampler.yaml:/config/config.yaml:ro
+    command: ["--config=/config/config.yaml"]
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_GROUP_ID: "${KAFKA_GROUP_ID:-otel-tail-sampler-smoke-v1}"
+      DECISION_WAIT: "${DECISION_WAIT:-5s}"
+      NUM_TRACES: "${NUM_TRACES:-75000}"
+      SAMPLED_CACHE_SIZE: "${SAMPLED_CACHE_SIZE:-100000}"
+      NON_SAMPLED_CACHE_SIZE: "${NON_SAMPLED_CACHE_SIZE:-1000000}"
+      SAMPLER_MEMORY_LIMIT_MIB: "${SAMPLER_MEMORY_LIMIT_MIB:-1024}"
+      SAMPLER_SPIKE_LIMIT_MIB: "${SAMPLER_SPIKE_LIMIT_MIB:-256}"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:13133"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: "${SAMPLER_MEMORY:-1280m}"
+    restart: unless-stopped

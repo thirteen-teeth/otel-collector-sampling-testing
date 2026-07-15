@@ -1,0 +1,59 @@
+# Ingest Collector: receives OTLP traces and writes 100% to otel-traces-raw
+# All spans for every trace are forwarded; no sampling happens here.
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: ${INGEST_MEMORY_LIMIT_MIB}
+    spike_limit_mib: ${INGEST_SPIKE_LIMIT_MIB}
+
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 4096
+    timeout: 200ms
+
+exporters:
+  kafka/raw:
+    brokers:
+      - "${KAFKA_BROKER}"
+    client_id: otel-raw-ingest
+    topic: otel-traces-raw
+    encoding: otlp_proto
+    # Ensures all spans for a trace share the same Kafka partition key (trace ID).
+    # Required so the single-replica tail-sampler sees complete traces.
+    partition_traces_by_id: true
+    producer:
+      required_acks: -1
+      compression: zstd
+      max_message_bytes: 10000000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 10000
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [kafka/raw]
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
