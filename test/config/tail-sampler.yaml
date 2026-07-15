@@ -1,0 +1,102 @@
+# Tail-Sampling Collector: consumes otel-traces-raw, applies 10% probabilistic
+# tail sampling, and writes retained traces to otel-traces-sampled.
+#
+# Run exactly ONE replica for correctness tests: the probabilistic processor
+# keeps trace state in memory, so a rebalance that splits a trace across two
+# replicas would cause that trace to be decided on incomplete data.
+#
+# Env-var overrides (set in docker-compose or the workflow):
+#   DECISION_WAIT          default 5s   (30s for full-scale runs)
+#   NUM_TRACES             default 50000 (3000000 for full-scale)
+#   SAMPLED_CACHE_SIZE     default 100000
+#   NON_SAMPLED_CACHE_SIZE default 1000000
+#   SAMPLER_MEMORY_LIMIT_MIB  default 1024 (12288 for full-scale)
+#   SAMPLER_SPIKE_LIMIT_MIB   default 256  (2048 for full-scale)
+#   KAFKA_BROKER           default kafka:9092
+#   KAFKA_GROUP_ID         default otel-tail-sampler-smoke-v1
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  kafka/raw:
+    brokers:
+      - "${KAFKA_BROKER:-kafka:9092}"
+    client_id: otel-tail-sampler
+    group_id: "${KAFKA_GROUP_ID:-otel-tail-sampler-smoke-v1}"
+    initial_offset: earliest
+    # traces.topics is the current Collector Contrib syntax (replaces singular `topic`).
+    traces:
+      topics:
+        - otel-traces-raw
+      encoding: otlp_proto
+    autocommit:
+      enable: true
+      interval: 1s
+    # Cooperative-sticky minimises stop-the-world rebalances if the group ever scales.
+    group_rebalance_strategies:
+      - cooperative-sticky
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: ${SAMPLER_MEMORY_LIMIT_MIB:-1024}
+    spike_limit_mib: ${SAMPLER_SPIKE_LIMIT_MIB:-256}
+
+  tail_sampling:
+    # How long to wait for all spans of a trace before making a decision.
+    decision_wait: "${DECISION_WAIT:-5s}"
+    # Maximum number of traces held in memory simultaneously.
+    # Must exceed: peak_new_traces_per_sec × decision_wait_sec × safety_factor
+    # Smoke default (205k traces, 5s window): ceil(205k/30s × 5 × 1.5) ≈ 52k → use 75k
+    num_traces: ${NUM_TRACES:-75000}
+    expected_new_traces_per_sec: 7000
+    # Cache keeps decisions for traces that arrive after the decision window.
+    decision_cache:
+      sampled_cache_size: ${SAMPLED_CACHE_SIZE:-100000}
+      non_sampled_cache_size: ${NON_SAMPLED_CACHE_SIZE:-1000000}
+    policies:
+      - name: proportional-10-percent
+        type: probabilistic
+        probabilistic:
+          # Hash of trace ID determines the decision; each service independently
+          # converges on ~10% regardless of its individual traffic volume.
+          sampling_percentage: 10
+
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 4096
+    timeout: 500ms
+
+exporters:
+  kafka/sampled:
+    brokers:
+      - "${KAFKA_BROKER:-kafka:9092}"
+    client_id: otel-sampled-output
+    topic: otel-traces-sampled
+    encoding: otlp_proto
+    partition_traces_by_id: true
+    producer:
+      required_acks: -1
+      compression: zstd
+      max_message_bytes: 10000000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 5000
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [kafka/raw]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [kafka/sampled]
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888

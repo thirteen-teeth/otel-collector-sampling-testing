@@ -1,0 +1,325 @@
+name: Tail-Sampling Full-Scale Test
+
+# Runs only on manual dispatch or a conservative weekly schedule.
+# Requires a larger runner (8+ cores, 32+ GB RAM) because the tail-sampler
+# must hold up to 3,000,000 concurrent in-flight traces in memory.
+#
+# Full-scale workload:
+#    5 low-volume  services × 10,000,000 traces  =   50,000,000 traces  (projected)
+#   10 high-volume services × 2,000,000  traces  =   20,000,000 traces
+#   Total: 20,050,000 traces, 10% tail sampling, 30s decision wait
+#
+# NOTE: The 20.05M run requires a self-hosted runner labeled 'self-hosted,large'
+# with sufficient memory.  This workflow NEVER runs on every PR.
+#
+# Cost estimate (GitHub-hosted 16-core/64 GB Linux):
+#   ~$2–$4 per run at $0.042/min for 45–75 minutes.
+# See README.md for full cost and resource breakdown.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner label (e.g. ubuntu-latest, self-hosted)"
+        required: false
+        default: "ubuntu-latest"
+      low_volume_services:
+        description: "Number of low-volume services"
+        required: false
+        default: "5"
+      low_volume_traces:
+        description: "Traces per low-volume service"
+        required: false
+        default: "10000"
+      high_volume_services:
+        description: "Number of high-volume services"
+        required: false
+        default: "10"
+      high_volume_traces:
+        description: "Traces per high-volume service"
+        required: false
+        default: "2000000"
+      decision_wait:
+        description: "Tail-sampling decision wait (e.g. 30s)"
+        required: false
+        default: "30s"
+      num_traces_capacity:
+        description: "Tail sampler num_traces (must exceed peak_rate×decision_wait)"
+        required: false
+        default: "3000000"
+      send_rate:
+        description: "Max new traces/sec per service worker (0=unlimited)"
+        required: false
+        default: "1000"
+      seed:
+        description: "PRNG seed for deterministic trace IDs"
+        required: false
+        default: "42"
+
+  # Conservative weekly schedule on Sunday at 02:00 UTC (low-traffic window).
+  # Adjust or remove once steady-state resource requirements are confirmed.
+  schedule:
+    - cron: "0 2 * * 0"
+
+# No concurrency limit: full-scale runs are expensive and should not be
+# cancelled mid-run.  Only one run at a time is expected.
+concurrency:
+  group: "tail-sampling-scale"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  scale-test:
+    name: Full-Scale Test
+    # Use the runner label from input, or fall back to ubuntu-latest for the schedule.
+    # For the 20.05M-trace run, use a self-hosted runner with 32+ GB RAM.
+    runs-on: ${{ github.event.inputs.runner_label || 'ubuntu-latest' }}
+    timeout-minutes: 180
+
+    env:
+      # ── Workload ──────────────────────────────────────────────────────────
+      LOW_VOLUME_SERVICES:  "${{ github.event.inputs.low_volume_services  || '5'       }}"
+      LOW_VOLUME_TRACES:    "${{ github.event.inputs.low_volume_traces    || '10000'   }}"
+      HIGH_VOLUME_SERVICES: "${{ github.event.inputs.high_volume_services || '10'      }}"
+      HIGH_VOLUME_TRACES:   "${{ github.event.inputs.high_volume_traces   || '2000000' }}"
+      MIN_SPANS: "2"
+      MAX_SPANS: "5"
+      SEND_RATE: "${{ github.event.inputs.send_rate || '1000' }}"
+      # ── Sampling ─────────────────────────────────────────────────────────
+      DECISION_WAIT:          "${{ github.event.inputs.decision_wait        || '30s'     }}"
+      NUM_TRACES:             "${{ github.event.inputs.num_traces_capacity  || '3000000' }}"
+      SAMPLED_CACHE_SIZE:     "3000000"
+      NON_SAMPLED_CACHE_SIZE: "30000000"
+      # ── Collector image ───────────────────────────────────────────────────
+      OTELCOL_VERSION: "0.108.0"
+      # ── Container memory (sized for 32 GB+ runner) ───────────────────────
+      KAFKA_MEMORY:   "4096m"
+      INGEST_MEMORY:  "2048m"
+      SAMPLER_MEMORY: "20480m"
+      INGEST_MEMORY_LIMIT_MIB: "1536"
+      INGEST_SPIKE_LIMIT_MIB:  "512"
+      SAMPLER_MEMORY_LIMIT_MIB: "16384"
+      SAMPLER_SPIKE_LIMIT_MIB:  "2048"
+      # ── Kafka ────────────────────────────────────────────────────────────
+      KAFKA_PARTITIONS: "12"
+      KAFKA_GROUP_ID: "otel-tail-sampler-scale-v1"
+      KAFKA_BROKERS: "localhost:9092"
+      # ── Test run identity ─────────────────────────────────────────────────
+      TEST_RUN_ID: "scale-${{ github.run_id }}-${{ github.run_attempt }}"
+      GENERATOR_SEED: "${{ github.event.inputs.seed || '42' }}"
+      # ── Metrics URLs ─────────────────────────────────────────────────────
+      INGEST_METRICS_URL: "http://localhost:8888/metrics"
+      SAMPLER_METRICS_URL: "http://localhost:8889/metrics"
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Log planned workload ──────────────────────────────────────────────
+      - name: Log planned workload
+        run: |
+          echo "=== Full-Scale Test Plan ==="
+          echo "Run ID         : ${TEST_RUN_ID}"
+          echo "Seed           : ${GENERATOR_SEED}"
+          echo "Low-vol svcs   : ${LOW_VOLUME_SERVICES} × ${LOW_VOLUME_TRACES} traces"
+          echo "High-vol svcs  : ${HIGH_VOLUME_SERVICES} × ${HIGH_VOLUME_TRACES} traces"
+          TOTAL=$(( LOW_VOLUME_SERVICES * LOW_VOLUME_TRACES + HIGH_VOLUME_SERVICES * HIGH_VOLUME_TRACES ))
+          echo "Total traces   : ${TOTAL}"
+          echo "Decision wait  : ${DECISION_WAIT}"
+          echo "Sampler mem    : ${SAMPLER_MEMORY_LIMIT_MIB} MiB"
+          echo "Num traces cap : ${NUM_TRACES}"
+          echo ""
+          echo "Runner: $(uname -m), $(nproc) CPUs, $(free -h | awk '/^Mem/{print $2}') RAM"
+          df -h /
+
+      # ── Validate configs ─────────────────────────────────────────────────
+      - name: Validate ingest-collector config
+        run: |
+          docker run --rm \
+            -e KAFKA_BROKER=kafka:9092 \
+            -e INGEST_MEMORY_LIMIT_MIB=${INGEST_MEMORY_LIMIT_MIB} \
+            -e INGEST_SPIKE_LIMIT_MIB=${INGEST_SPIKE_LIMIT_MIB} \
+            -v "${{ github.workspace }}/test/config/ingest-collector.yaml:/config/config.yaml:ro" \
+            otel/opentelemetry-collector-contrib:${{ env.OTELCOL_VERSION }} \
+            validate --config=/config/config.yaml
+
+      - name: Validate tail-sampler config
+        run: |
+          docker run --rm \
+            -e KAFKA_BROKER=kafka:9092 \
+            -e KAFKA_GROUP_ID=${KAFKA_GROUP_ID} \
+            -e DECISION_WAIT=${DECISION_WAIT} \
+            -e NUM_TRACES=${NUM_TRACES} \
+            -e SAMPLED_CACHE_SIZE=${SAMPLED_CACHE_SIZE} \
+            -e NON_SAMPLED_CACHE_SIZE=${NON_SAMPLED_CACHE_SIZE} \
+            -e SAMPLER_MEMORY_LIMIT_MIB=${SAMPLER_MEMORY_LIMIT_MIB} \
+            -e SAMPLER_SPIKE_LIMIT_MIB=${SAMPLER_SPIKE_LIMIT_MIB} \
+            -v "${{ github.workspace }}/test/config/tail-sampler.yaml:/config/config.yaml:ro" \
+            otel/opentelemetry-collector-contrib:${{ env.OTELCOL_VERSION }} \
+            validate --config=/config/config.yaml
+
+      # ── Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r test/unit/requirements.txt
+          pip install -r test/generator/requirements.txt
+          pip install -r test/validator/requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m pytest test/unit/ -v \
+            --tb=short \
+            --junit-xml=test-results/unit-tests.xml
+        env:
+          PYTHONPATH: "${{ github.workspace }}/test"
+
+      # ── Start infrastructure ───────────────────────────────────────────────
+      - name: Start Kafka and collectors
+        working-directory: test
+        run: docker compose up -d kafka ingest-collector tail-sampler
+        env:
+          COMPOSE_PROJECT_NAME: otel-scale
+
+      - name: Wait for infrastructure readiness
+        run: |
+          bash test/scripts/wait-ready.sh http://localhost:13133 "ingest-collector" 180 5
+          bash test/scripts/wait-ready.sh http://localhost:13134 "tail-sampler"     180 5
+
+      - name: Collect baseline metrics
+        run: |
+          mkdir -p artifacts/metrics
+          bash test/scripts/collect-metrics.sh baseline
+        env:
+          OUTPUT_DIR: artifacts/metrics
+        continue-on-error: true
+
+      # ── Generate traces ────────────────────────────────────────────────────
+      - name: Generate traces
+        run: |
+          mkdir -p artifacts
+          python test/generator/generator.py \
+            --run-id "${TEST_RUN_ID}" \
+            --seed "${GENERATOR_SEED}" \
+            --low-volume-services "${LOW_VOLUME_SERVICES}" \
+            --low-volume-traces "${LOW_VOLUME_TRACES}" \
+            --high-volume-services "${HIGH_VOLUME_SERVICES}" \
+            --high-volume-traces "${HIGH_VOLUME_TRACES}" \
+            --min-spans "${MIN_SPANS}" \
+            --max-spans "${MAX_SPANS}" \
+            --rate "${SEND_RATE}" \
+            --endpoint "localhost:4317" \
+            --output artifacts/generator-manifest.json
+
+      # ── Wait for processing ────────────────────────────────────────────────
+      - name: Wait for tail-sampling decision window
+        run: |
+          # decision_wait=30s + generous buffer for large backlogs
+          echo "Waiting 90s for the tail-sampling decision window and Kafka lag drain..."
+          sleep 90
+
+      - name: Collect post-generation metrics
+        run: |
+          bash test/scripts/collect-metrics.sh post-generation
+        env:
+          OUTPUT_DIR: artifacts/metrics
+        continue-on-error: true
+
+      # ── Validate ──────────────────────────────────────────────────────────
+      - name: Run validator
+        run: |
+          python test/validator/validator.py \
+            --run-id "${TEST_RUN_ID}" \
+            --brokers "${KAFKA_BROKERS}" \
+            --manifest artifacts/generator-manifest.json \
+            --output-dir artifacts \
+            --timeout-ms 30000
+
+      # ── Collect artifacts & logs ─────────────────────────────────────────
+      - name: Collect container logs and stats
+        if: always()
+        working-directory: test
+        run: |
+          mkdir -p ../artifacts/logs
+          docker compose logs ingest-collector > ../artifacts/logs/ingest-collector.log 2>&1 || true
+          docker compose logs tail-sampler     > ../artifacts/logs/tail-sampler.log     2>&1 || true
+          docker compose logs kafka            > ../artifacts/logs/kafka.log            2>&1 || true
+          docker stats --no-stream --format \
+            "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" \
+            > ../artifacts/container-stats.txt 2>&1 || true
+        env:
+          COMPOSE_PROJECT_NAME: otel-scale
+
+      - name: Collect final metrics
+        if: always()
+        run: bash test/scripts/collect-metrics.sh final
+        env:
+          OUTPUT_DIR: artifacts/metrics
+        continue-on-error: true
+
+      # ── Publish results ────────────────────────────────────────────────────
+      - name: Publish JUnit results
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: |
+            test-results/unit-tests.xml
+            artifacts/validation-junit.xml
+          check_name: "Tail Sampling – Full-Scale Test"
+          fail_on_failure: true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "scale-test-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            artifacts/
+            test-results/
+          retention-days: 90
+
+      - name: Print validation summary
+        if: always()
+        run: |
+          echo "=== Full-Scale Validation Results ==="
+          if [ -f artifacts/validation.json ]; then
+            python3 -c "
+          import json, sys
+          with open('artifacts/validation.json') as f:
+              r = json.load(f)
+          print('Overall:', 'PASS' if r['overall_pass'] else 'FAIL')
+          print(f'Raw unique traces    : {r[\"raw_unique_total\"]:,}')
+          print(f'Sampled unique traces: {r[\"sampled_unique_total\"]:,}')
+          agg = r.get('aggregate', {})
+          print(f'Aggregate rate       : {agg.get(\"sample_rate\", 0)*100:.3f}%')
+          print(f'Sigma deviation      : {agg.get(\"sigma_deviation\", \"?\")}σ')
+          print()
+          print('Per-service results:')
+          for svc in r.get('services', []):
+              status = 'PASS' if svc['stat_pass'] else 'FAIL'
+              print(f'  {status} {svc[\"service\"]:<25} raw={svc[\"raw_traces\"]:>9,} sampled={svc[\"sampled_traces\"]:>7,} rate={svc[\"sample_rate\"]*100:.2f}% dev={svc[\"sigma_deviation\"]:.2f}σ')
+          for f in r.get('failures', []):
+              print(f'  FAIL: {f}')
+          sys.exit(0 if r['overall_pass'] else 1)
+          "
+          else
+            echo "validation.json not found"
+            exit 1
+          fi
+
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Stop and remove containers
+        if: always()
+        working-directory: test
+        run: docker compose down -v --remove-orphans
+        env:
+          COMPOSE_PROJECT_NAME: otel-scale
