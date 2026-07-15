@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from opentelemetry import trace as otrace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -52,7 +52,7 @@ class ControlledIdGenerator(IdGenerator):
 
     def __init__(self, seed: int) -> None:
         self._rng = random.Random(seed)
-        self._next_trace_id: int | None = None
+        self._next_trace_id: Optional[int] = None
 
     def set_next_trace_id(self, trace_id: int) -> None:
         self._next_trace_id = trace_id
@@ -180,7 +180,7 @@ def _generate_service(
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Deterministic OTLP trace generator for tail-sampling tests"
     )
@@ -269,7 +269,7 @@ def build_service_list(args: argparse.Namespace) -> list[ServiceClass]:
     return services
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

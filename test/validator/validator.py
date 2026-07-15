@@ -233,8 +233,8 @@ def validate(
     """
     Run all validation checks and return a structured result dict.
     """
-    failures: list[str] = []
-    warnings: list[str] = []
+    failures: List[str] = []
+    warnings: List[str] = []
 
     # ── Group by owner service ──────────────────────────────────────────────
     raw_by_service: Dict[str, Set[str]] = defaultdict(set)
@@ -370,7 +370,7 @@ def validate(
         "aggregate": agg_result,
         "raw_unique_total": len(raw_records),
         "sampled_unique_total": len(sampled_records),
-        "orphan_sampled_count": len(orphan_sampled) if "orphan_sampled" in dir() else 0,
+        "orphan_sampled_count": len(orphan_sampled),
     }
 
 
@@ -449,7 +449,7 @@ def write_junit(results: dict, path: str, run_id: str) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Statistical reconciliation validator for tail-sampling tests"
     )
@@ -492,7 +492,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
