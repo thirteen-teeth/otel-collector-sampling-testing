@@ -6,14 +6,14 @@
 # replicas would cause that trace to be decided on incomplete data.
 #
 # Env-var overrides (set in docker-compose or the workflow):
-#   DECISION_WAIT          default 5s   (30s for full-scale runs)
-#   NUM_TRACES             default 50000 (3000000 for full-scale)
-#   SAMPLED_CACHE_SIZE     default 100000
-#   NON_SAMPLED_CACHE_SIZE default 1000000
-#   SAMPLER_MEMORY_LIMIT_MIB  default 1024 (12288 for full-scale)
-#   SAMPLER_SPIKE_LIMIT_MIB   default 256  (2048 for full-scale)
-#   KAFKA_BROKER           default kafka:9092
-#   KAFKA_GROUP_ID         default otel-tail-sampler-smoke-v1
+#   DECISION_WAIT          (e.g. 5s for smoke, 30s for full-scale runs)
+#   NUM_TRACES             (e.g. 75000 for smoke, 3000000 for full-scale)
+#   SAMPLED_CACHE_SIZE     (e.g. 100000)
+#   NON_SAMPLED_CACHE_SIZE (e.g. 1000000)
+#   SAMPLER_MEMORY_LIMIT_MIB  (e.g. 1024 for smoke, 12288 for full-scale)
+#   SAMPLER_SPIKE_LIMIT_MIB   (e.g. 256 for smoke, 2048 for full-scale)
+#   KAFKA_BROKER           (e.g. kafka:9092)
+#   KAFKA_GROUP_ID         (e.g. otel-tail-sampler-smoke-v1)
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -21,9 +21,9 @@ extensions:
 receivers:
   kafka/raw:
     brokers:
-      - "${KAFKA_BROKER:-kafka:9092}"
+      - "${KAFKA_BROKER}"
     client_id: otel-tail-sampler
-    group_id: "${KAFKA_GROUP_ID:-otel-tail-sampler-smoke-v1}"
+    group_id: "${KAFKA_GROUP_ID}"
     initial_offset: earliest
     # traces.topics is the current Collector Contrib syntax (replaces singular `topic`).
     traces:
@@ -40,21 +40,21 @@ receivers:
 processors:
   memory_limiter:
     check_interval: 1s
-    limit_mib: ${SAMPLER_MEMORY_LIMIT_MIB:-1024}
-    spike_limit_mib: ${SAMPLER_SPIKE_LIMIT_MIB:-256}
+    limit_mib: ${SAMPLER_MEMORY_LIMIT_MIB}
+    spike_limit_mib: ${SAMPLER_SPIKE_LIMIT_MIB}
 
   tail_sampling:
     # How long to wait for all spans of a trace before making a decision.
-    decision_wait: "${DECISION_WAIT:-5s}"
+    decision_wait: "${DECISION_WAIT}"
     # Maximum number of traces held in memory simultaneously.
     # Must exceed: peak_new_traces_per_sec × decision_wait_sec × safety_factor
     # Smoke default (205k traces, 5s window): ceil(205k/30s × 5 × 1.5) ≈ 52k → use 75k
-    num_traces: ${NUM_TRACES:-75000}
+    num_traces: ${NUM_TRACES}
     expected_new_traces_per_sec: 7000
     # Cache keeps decisions for traces that arrive after the decision window.
     decision_cache:
-      sampled_cache_size: ${SAMPLED_CACHE_SIZE:-100000}
-      non_sampled_cache_size: ${NON_SAMPLED_CACHE_SIZE:-1000000}
+      sampled_cache_size: ${SAMPLED_CACHE_SIZE}
+      non_sampled_cache_size: ${NON_SAMPLED_CACHE_SIZE}
     policies:
       - name: proportional-10-percent
         type: probabilistic
@@ -71,7 +71,7 @@ processors:
 exporters:
   kafka/sampled:
     brokers:
-      - "${KAFKA_BROKER:-kafka:9092}"
+      - "${KAFKA_BROKER}"
     client_id: otel-sampled-output
     topic: otel-traces-sampled
     encoding: otlp_proto

@@ -15,8 +15,8 @@ receivers:
 processors:
   memory_limiter:
     check_interval: 1s
-    limit_mib: ${INGEST_MEMORY_LIMIT_MIB:-512}
-    spike_limit_mib: ${INGEST_SPIKE_LIMIT_MIB:-128}
+    limit_mib: ${INGEST_MEMORY_LIMIT_MIB}
+    spike_limit_mib: ${INGEST_SPIKE_LIMIT_MIB}
 
   batch:
     send_batch_size: 1024
@@ -26,7 +26,7 @@ processors:
 exporters:
   kafka/raw:
     brokers:
-      - "${KAFKA_BROKER:-kafka:9092}"
+      - "${KAFKA_BROKER}"
     client_id: otel-raw-ingest
     topic: otel-traces-raw
     encoding: otlp_proto
